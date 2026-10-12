@@ -26,25 +26,29 @@ jobs:
       BUILDER_ID: ""
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_OWNER_ID }}
-      RCLONE_REMOTE_NAME: ${{ vars.RCLONE_REMOTE_NAME || secrets.RCLONE_REMOTE_NAME }}
-      RCLONE_UPLOAD_DIR: ${{ vars.RCLONE_UPLOAD_DIR || secrets.RCLONE_UPLOAD_DIR }}
-      RCLONE_PUBLIC_LINK_BASE: ${{ vars.RCLONE_PUBLIC_LINK_BASE || secrets.RCLONE_PUBLIC_LINK_BASE }}
+      RCLONE_REMOTE_NAME: ${{ secrets.RCLONE_REMOTE_NAME }}
+      RCLONE_UPLOAD_DIR: ${{ secrets.RCLONE_UPLOAD_DIR }}
+      RCLONE_PUBLIC_LINK_BASE: ${{ secrets.RCLONE_PUBLIC_LINK_BASE }}
     steps:
       - name: Validate configuration
         env:
           ENGINE_READ_TOKEN: ${{ secrets.ENGINE_READ_TOKEN }}
-          CONFIG_READ_TOKEN: ${{ secrets.CONFIG_READ_TOKEN }}
           ENGINE_REPO: ${{ secrets.ENGINE_REPO }}
-          CONFIG_REPO: ${{ secrets.CONFIG_REPO }}
+          RCLONE_CONFIG_B64: ${{ secrets.RCLONE_CONFIG_B64 }}
         run: |
           set -euo pipefail
           [[ -n "$ENGINE_REPO" ]] || { echo "::error::Missing ENGINE_REPO"; exit 1; }
-          [[ -n "$CONFIG_REPO" ]] || { echo "::error::Missing CONFIG_REPO"; exit 1; }
           [[ -n "$ENGINE_READ_TOKEN" ]] || {
             echo "::error::Missing ENGINE_READ_TOKEN"; exit 1;
           }
-          [[ -n "$CONFIG_READ_TOKEN" ]] || {
-            echo "::error::Missing CONFIG_READ_TOKEN"; exit 1;
+          [[ -n "$RCLONE_CONFIG_B64" ]] || {
+            echo "::error::Missing RCLONE_CONFIG_B64"; exit 1;
+          }
+          [[ -n "$RCLONE_REMOTE_NAME" ]] || {
+            echo "::error::Missing RCLONE_REMOTE_NAME"; exit 1;
+          }
+          [[ -n "$RCLONE_UPLOAD_DIR" ]] || {
+            echo "::error::Missing RCLONE_UPLOAD_DIR"; exit 1;
           }
           [[ "$INPUT_URL" == https://* ]] || {
             echo "::error::The ROM URL must start with https://"; exit 1;
@@ -184,30 +188,33 @@ jobs:
       - name: Load upload configuration
         working-directory: engine
         env:
-          CONFIG_READ_TOKEN: ${{ secrets.CONFIG_READ_TOKEN }}
-          CONFIG_REPO: ${{ secrets.CONFIG_REPO }}
+          RCLONE_CONFIG_B64: ${{ secrets.RCLONE_CONFIG_B64 }}
         run: |
           set -euo pipefail
-          if sudo -E bash uploadROM.sh setup \
-              "$CONFIG_READ_TOKEN" "$CONFIG_REPO" \
-              "rclone.conf" "build.env" \
-              > "$RUNNER_TEMP/config-output.log" 2>&1; then
-            echo "Upload configuration loaded."
-          else
-            echo "::error::Could not load upload configuration."
+          umask 077
+          if ! printf '%s' "$RCLONE_CONFIG_B64" | base64 --decode > rclone.conf; then
+            rm -f rclone.conf
+            echo "::error::Could not decode RCLONE_CONFIG_B64."
             exit 1
           fi
+          chmod 600 rclone.conf
+          [[ -s rclone.conf ]] || {
+            echo "::error::Decoded Drive configuration is empty."
+            exit 1
+          }
+          unset RCLONE_CONFIG_B64
+          echo "Upload configuration loaded."
       - name: Verify Drive routing settings
         working-directory: engine
         run: |
           set -euo pipefail
           [[ -s rclone.conf ]] || { echo "::error::rclone.conf not found."; exit 1; }
           [[ -n "$RCLONE_REMOTE_NAME" ]] || {
-            echo "::error::Missing RCLONE_REMOTE_NAME in Actions variables or configuration file."
+            echo "::error::Missing RCLONE_REMOTE_NAME in Actions Secrets."
             exit 1
           }
           [[ -n "$RCLONE_UPLOAD_DIR" ]] || {
-            echo "::error::Missing RCLONE_UPLOAD_DIR in Actions variables or configuration file."
+            echo "::error::Missing RCLONE_UPLOAD_DIR in Actions Secrets."
             exit 1
           }
           sudo -E rclone --config="$PWD/rclone.conf" listremotes 2>/dev/null | \
@@ -292,6 +299,10 @@ jobs:
           python3 notify.py fail \
             "$REPO_NAME" "$ROM_LINK" "$ROM_PREFIX" \
             "$BUILDER_NAME" "$BUILDER_ID" || true
+      - name: Remove temporary upload credentials
+        if: always()
+        run: |
+          rm -f "$GITHUB_WORKSPACE/engine/rclone.conf"
       - name: Build summary
         if: always()
         run: |
