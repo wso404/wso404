@@ -6,6 +6,10 @@ on:
         description: Direct HTTPS URL of the base ROM ZIP
         type: string
         required: true
+      vendor_odm_url:
+        description: "Google Drive URL of vendor_odm.zip for sweet"
+        required: true
+        type: string
 permissions:
   contents: read
 concurrency:
@@ -19,6 +23,7 @@ jobs:
     timeout-minutes: 360
     env:
       INPUT_URL: ${{ inputs.input_url }}
+      VENDOR_ODM_URL: ${{ inputs.vendor_odm_url }}
       REPO_NAME: ${{ github.repository }}
       ROM_LINK: ${{ inputs.input_url }}
       ROM_PREFIX: xiaomi
@@ -52,6 +57,9 @@ jobs:
           }
           [[ "$INPUT_URL" == https://* ]] || {
             echo "::error::The ROM URL must start with https://"; exit 1;
+          }
+          [[ "$VENDOR_ODM_URL" == https://* ]] || {
+            echo "::error::vendor_odm.zip URL must start with https://"; exit 1;
           }
           if [[ -n "${TELEGRAM_CHANNEL_ID:-}" && ! "$TELEGRAM_CHANNEL_ID" =~ ^[1-9][0-9]*$ ]]; then
             echo "::error::TELEGRAM_OWNER_ID must be your positive numeric personal Telegram ID."
@@ -114,8 +122,8 @@ jobs:
             python3-pip dialog aapt busybox zip erofs-utils erofsfuse \
             unzip p7zip-full zipalign zstd bc android-sdk-libsparse-utils xmlstarlet
           sudo pip3 install --break-system-packages --no-cache-dir \
-            ConfigObj telebot setuptools requests || \
-            sudo pip3 install --no-cache-dir ConfigObj telebot setuptools requests
+            ConfigObj telebot setuptools requests gdown==5.2.0 || \
+            sudo pip3 install --no-cache-dir ConfigObj telebot setuptools requests gdown==5.2.0
       - name: Check free disk space
         run: |
           set -euo pipefail
@@ -313,3 +321,4 @@ jobs:
             echo "No build output is uploaded as a workflow artifact."
             echo "Review the job outcome above for the final result."
           } >> "$GITHUB_STEP_SUMMARY"
+
