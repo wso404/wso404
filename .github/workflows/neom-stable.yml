@@ -1,15 +1,4 @@
 name: Stable Manual Build
-on:
-  workflow_dispatch:
-    inputs:
-      input_url:
-        description: Direct HTTPS URL of the base ROM ZIP
-        type: string
-        required: true
-      vendor_odm_url:
-        description: "Google Drive URL of vendor_odm.zip for sweet"
-        required: true
-        type: string
 permissions:
   contents: read
 concurrency:
@@ -28,297 +17,362 @@ jobs:
       ROM_LINK: ${{ inputs.input_url }}
       ROM_PREFIX: xiaomi
       BUILDER_NAME: ${{ github.actor }}
-      BUILDER_ID: ""
+      BUILDER_ID: ''
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_OWNER_ID }}
       RCLONE_REMOTE_NAME: ${{ secrets.RCLONE_REMOTE_NAME }}
       RCLONE_UPLOAD_DIR: ${{ secrets.RCLONE_UPLOAD_DIR }}
       RCLONE_PUBLIC_LINK_BASE: ${{ secrets.RCLONE_PUBLIC_LINK_BASE }}
+      TELEGRAM_OWNER_ID: ${{ secrets.TELEGRAM_OWNER_ID }}
+      NEOM_LOG_DIR: ${{ runner.temp }}/neom-private-logs
+      NEOM_PRIVATE_LOG_DIR: ${{ runner.temp }}/neom-private-logs
+      NEOM_CI_HELPER: ${{ github.workspace }}/.ci/.github/scripts/private_ci.py
     steps:
-      - name: Validate configuration
-        env:
-          ENGINE_READ_TOKEN: ${{ secrets.ENGINE_READ_TOKEN }}
-          ENGINE_REPO: ${{ secrets.ENGINE_REPO }}
-          RCLONE_CONFIG_B64: ${{ secrets.RCLONE_CONFIG_B64 }}
-        run: |
-          set -euo pipefail
-          [[ -n "$ENGINE_REPO" ]] || { echo "::error::Missing ENGINE_REPO"; exit 1; }
-          [[ -n "$ENGINE_READ_TOKEN" ]] || {
-            echo "::error::Missing ENGINE_READ_TOKEN"; exit 1;
-          }
-          [[ -n "$RCLONE_CONFIG_B64" ]] || {
-            echo "::error::Missing RCLONE_CONFIG_B64"; exit 1;
-          }
-          [[ -n "$RCLONE_REMOTE_NAME" ]] || {
-            echo "::error::Missing RCLONE_REMOTE_NAME"; exit 1;
-          }
-          [[ -n "$RCLONE_UPLOAD_DIR" ]] || {
-            echo "::error::Missing RCLONE_UPLOAD_DIR"; exit 1;
-          }
-          [[ "$INPUT_URL" == https://* ]] || {
-            echo "::error::The ROM URL must start with https://"; exit 1;
-          }
-          [[ "$VENDOR_ODM_URL" == https://* ]] || {
-            echo "::error::vendor_odm.zip URL must start with https://"; exit 1;
-          }
-          if [[ -n "${TELEGRAM_CHANNEL_ID:-}" && ! "$TELEGRAM_CHANNEL_ID" =~ ^[1-9][0-9]*$ ]]; then
-            echo "::error::TELEGRAM_OWNER_ID must be your positive numeric personal Telegram ID."
+    - name: Maximize available build space
+      uses: easimon/maximize-build-space@fc881a613ad2a34aca9c9624518214ebc21dfc0c
+      with:
+        swap-size-mb: 1024
+        root-reserve-mb: 512
+        remove-dotnet: 'true'
+        remove-android: 'true'
+        remove-haskell: 'true'
+        remove-codeql: 'true'
+        remove-docker-images: 'true'
+      id: space
+    - name: Checkout workflow logging utilities
+      id: checkout_utils
+      uses: actions/checkout@v5
+      with:
+        path: .ci
+        fetch-depth: 1
+        show-progress: false
+        persist-credentials: false
+    - name: Initialize private build logs
+      id: init_logs
+      run: |
+        python3 "$NEOM_CI_HELPER" init
+    - name: Validate configuration
+      env:
+        ENGINE_READ_TOKEN: ${{ secrets.ENGINE_READ_TOKEN }}
+        ENGINE_REPO: ${{ secrets.ENGINE_REPO }}
+        RCLONE_CONFIG_B64: ${{ secrets.RCLONE_CONFIG_B64 }}
+      run: |
+        python3 "$NEOM_CI_HELPER" run validate -- bash -e -u -o pipefail <<'NEOM_PRIVATE_STAGE'
+        set -euo pipefail
+        [[ -n "$ENGINE_REPO" ]] || { echo "::error::Missing ENGINE_REPO"; exit 1; }
+        [[ -n "$ENGINE_READ_TOKEN" ]] || {
+          echo "::error::Missing ENGINE_READ_TOKEN"; exit 1;
+        }
+        [[ -n "$RCLONE_CONFIG_B64" ]] || {
+          echo "::error::Missing RCLONE_CONFIG_B64"; exit 1;
+        }
+        [[ -n "$RCLONE_REMOTE_NAME" ]] || {
+          echo "::error::Missing RCLONE_REMOTE_NAME"; exit 1;
+        }
+        [[ -n "$RCLONE_UPLOAD_DIR" ]] || {
+          echo "::error::Missing RCLONE_UPLOAD_DIR"; exit 1;
+        }
+        [[ "$INPUT_URL" == https://* ]] || {
+          echo "::error::The ROM URL must start with https://"; exit 1;
+        }
+        [[ "$VENDOR_ODM_URL" == https://* ]] || {
+          echo "::error::vendor_odm.zip URL must start with https://"; exit 1;
+        }
+        if [[ -n "${TELEGRAM_CHANNEL_ID:-}" && ! "$TELEGRAM_CHANNEL_ID" =~ ^[1-9][0-9]*$ ]]; then
+          echo "::error::TELEGRAM_OWNER_ID must be your positive numeric personal Telegram ID."
+          exit 1
+        fi
+        if [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHANNEL_ID:-}" ]]; then
+          echo "::error::TELEGRAM_BOT_TOKEN and TELEGRAM_OWNER_ID are required for private logs."
+          exit 1
+        fi
+        NEOM_PRIVATE_STAGE
+      id: validate
+    - name: Checkout source privately
+      id: checkout_engine
+      env:
+        ENGINE_READ_TOKEN: ${{ secrets.ENGINE_READ_TOKEN }}
+        ENGINE_REPO: ${{ secrets.ENGINE_REPO }}
+      run: |
+        python3 "$NEOM_CI_HELPER" run checkout -- python3 "$NEOM_CI_HELPER" checkout "$GITHUB_WORKSPACE/engine"
+    - name: Prepare tools
+      working-directory: engine
+      run: |
+        python3 "$NEOM_CI_HELPER" run prepare -- bash -e -u -o pipefail <<'NEOM_PRIVATE_STAGE'
+        set -euo pipefail
+        for required in build.sh functions.sh packROM.sh uploadROM.sh notify.py; do
+          [[ -f "$required" ]] || {
+            echo "::error::A required file is missing."
             exit 1
-          fi
-          if [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHANNEL_ID:-}" ]]; then
-            echo "::warning::Notification settings are incomplete."
-          fi
-      - name: Maximize available build space
-        uses: easimon/maximize-build-space@fc881a613ad2a34aca9c9624518214ebc21dfc0c
-        with:
-          swap-size-mb: 1024
-          root-reserve-mb: 512
-          remove-dotnet: 'true'
-          remove-android: 'true'
-          remove-haskell: 'true'
-          remove-codeql: 'true'
-          remove-docker-images: 'true'
-      - name: Checkout source
-        uses: actions/checkout@v5
-        with:
-          repository: ${{ secrets.ENGINE_REPO }}
-          ref: main
-          token: ${{ secrets.ENGINE_READ_TOKEN }}
-          path: engine
-          fetch-depth: 1
-          show-progress: false
-          persist-credentials: false
-      - name: Prepare tools
-        working-directory: engine
-        run: |
-          set -euo pipefail
-          for required in build.sh functions.sh packROM.sh uploadROM.sh notify.py; do
-            [[ -f "$required" ]] || {
-              echo "::error::A required file is missing."
-              exit 1
-            }
-          done
-          [[ -d bin/Linux/x86_64 ]] || {
-            echo "::error::Required tools were not found."
-            exit 1
           }
-          find bin/Linux/x86_64 -maxdepth 1 -type f -exec chmod +x {} +
-          find bin -type f -name '*.sh' -exec chmod +x {} +
-          chmod +x build.sh packROM.sh uploadROM.sh
-          echo "Source checkout completed."
-          df -h .
-      - name: Install Java 17
-        uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: '17'
-      - name: Install build dependencies
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            aria2 jq rclone sshpass python-is-python3 wget python3 \
-            lz4 xz-utils zlib1g-dev gcc g++ libc6 libstdc++6 \
-            python3-pip dialog aapt busybox zip erofs-utils erofsfuse \
-            unzip p7zip-full zipalign zstd bc android-sdk-libsparse-utils xmlstarlet
-          sudo pip3 install --break-system-packages --no-cache-dir \
-            ConfigObj telebot setuptools requests gdown==5.2.0 || \
-            sudo pip3 install --no-cache-dir ConfigObj telebot setuptools requests gdown==5.2.0
-      - name: Check free disk space
-        run: |
-          set -euo pipefail
-          df -h "$GITHUB_WORKSPACE"
-          echo "::notice::Very large ROMs may require more disk space than the standard runner provides."
-      - name: Send build notification
-        working-directory: engine
-        run: |
-          python3 notify.py start \
-            "$REPO_NAME" "$ROM_LINK" "$ROM_PREFIX" \
-            "$BUILDER_NAME" "$BUILDER_ID" || true
-      - name: Download extract and modify ROM
-        working-directory: engine
-        run: |
-          set -euo pipefail
-          if sudo -E bash build.sh \
-              "$INPUT_URL" "$REPO_NAME" "$ROM_PREFIX" \
-              "$BUILDER_NAME" "$BUILDER_ID" \
-              > "$RUNNER_TEMP/build-output.log" 2>&1; then
-            echo "ROM extraction and modification stage finished."
+        done
+        [[ -d bin/Linux/x86_64 ]] || {
+          echo "::error::Required tools were not found."
+          exit 1
+        }
+        find bin/Linux/x86_64 -maxdepth 1 -type f -exec chmod +x {} +
+        find bin -type f -name '*.sh' -exec chmod +x {} +
+        chmod +x build.sh packROM.sh uploadROM.sh
+        echo "Source checkout completed."
+        df -h .
+        NEOM_PRIVATE_STAGE
+      id: prepare
+    - name: Install Java 17
+      uses: actions/setup-java@v5
+      with:
+        distribution: temurin
+        java-version: '17'
+      id: java
+    - name: Install build dependencies
+      run: |
+        python3 "$NEOM_CI_HELPER" run dependencies -- bash -e -u -o pipefail <<'NEOM_PRIVATE_STAGE'
+        set -euo pipefail
+        sudo apt-get update
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+          aria2 jq rclone sshpass python-is-python3 wget python3 \
+          lz4 xz-utils zlib1g-dev gcc g++ libc6 libstdc++6 \
+          python3-pip dialog aapt busybox zip erofs-utils erofsfuse \
+          unzip p7zip-full zipalign zstd bc android-sdk-libsparse-utils xmlstarlet
+        sudo pip3 install --break-system-packages --no-cache-dir \
+          ConfigObj telebot setuptools requests gdown==5.2.0 || \
+          sudo pip3 install --no-cache-dir ConfigObj telebot setuptools requests gdown==5.2.0
+        NEOM_PRIVATE_STAGE
+      id: dependencies
+    - name: Check free disk space
+      run: |
+        python3 "$NEOM_CI_HELPER" run disk -- bash -e -u -o pipefail <<'NEOM_PRIVATE_STAGE'
+        set -euo pipefail
+        df -h "$GITHUB_WORKSPACE"
+        echo "::notice::Very large ROMs may require more disk space than the standard runner provides."
+        NEOM_PRIVATE_STAGE
+      id: disk
+    - name: Load upload configuration
+      working-directory: engine
+      env:
+        RCLONE_CONFIG_B64: ${{ secrets.RCLONE_CONFIG_B64 }}
+      run: |
+        python3 "$NEOM_CI_HELPER" run drive_config -- bash -e -u -o pipefail <<'NEOM_PRIVATE_STAGE'
+        set -euo pipefail
+        umask 077
+        if ! printf '%s' "$RCLONE_CONFIG_B64" | base64 --decode > rclone.conf; then
+          rm -f rclone.conf
+          echo "::error::Could not decode RCLONE_CONFIG_B64."
+          exit 1
+        fi
+        chmod 600 rclone.conf
+        [[ -s rclone.conf ]] || {
+          echo "::error::Decoded Drive configuration is empty."
+          exit 1
+        }
+        unset RCLONE_CONFIG_B64
+        echo "Upload configuration loaded."
+        NEOM_PRIVATE_STAGE
+      id: drive_config
+    - name: Check Drive configuration and authentication privately
+      id: drive_check
+      working-directory: engine
+      run: |
+        python3 "$NEOM_CI_HELPER" run drive-check -- python3 "$NEOM_CI_HELPER" check-drive "$PWD/rclone.conf"
+    - name: Send build notification
+      working-directory: engine
+      run: |
+        python3 "$NEOM_CI_HELPER" run notify_start -- bash -e -u -o pipefail <<'NEOM_PRIVATE_STAGE'
+        python3 notify.py start \
+          "$REPO_NAME" "$ROM_LINK" "$ROM_PREFIX" \
+          "$BUILDER_NAME" "$BUILDER_ID" || true
+        NEOM_PRIVATE_STAGE
+      id: notify_start
+    - name: Download extract and modify ROM
+      working-directory: engine
+      run: |
+        python3 "$NEOM_CI_HELPER" run build -- bash -e -u -o pipefail <<'NEOM_PRIVATE_STAGE'
+        set -euo pipefail
+        if sudo -E bash build.sh \
+            "$INPUT_URL" "$REPO_NAME" "$ROM_PREFIX" \
+            "$BUILDER_NAME" "$BUILDER_ID" \
+            2>&1 | tee "$NEOM_LOG_DIR/build-output.log"; then
+          echo "ROM extraction and modification stage finished."
+        else
+          if grep -Fq 'No space left on device' "$NEOM_LOG_DIR/build-output.log"; then
+            echo "::error::Disk capacity exhausted while extracting the ROM."
+          elif grep -Fq 'Unpacking payload.bin failed' "$NEOM_LOG_DIR/build-output.log"; then
+            echo "::error::The payload.bin extraction stage failed."
           else
-            if grep -Fq 'No space left on device' "$RUNNER_TEMP/build-output.log"; then
-              echo "::error::Disk capacity exhausted while extracting the ROM."
-            elif grep -Fq 'Unpacking payload.bin failed' "$RUNNER_TEMP/build-output.log"; then
-              echo "::error::The payload.bin extraction stage failed."
-            else
-              echo "::error::Download, extraction or modification failed."
-            fi
-            df -h . || true
-            exit 1
+            echo "::error::Download, extraction or modification failed."
           fi
-          df -h .
-      - name: Repack ROM
-        working-directory: engine
-        run: |
-          set -euo pipefail
-          python3 notify.py pack \
-            "$REPO_NAME" "$ROM_LINK" "$ROM_PREFIX" \
-            "$BUILDER_NAME" "$BUILDER_ID" || true
-          if sudo -E bash packROM.sh > "$RUNNER_TEMP/pack-output.log" 2>&1; then
-            echo "ROM repacking stage finished."
+          df -h . || true
+          exit 1
+        fi
+        df -h .
+        NEOM_PRIVATE_STAGE
+      id: build
+    - name: Repack ROM
+      working-directory: engine
+      run: |
+        python3 "$NEOM_CI_HELPER" run pack -- bash -e -u -o pipefail <<'NEOM_PRIVATE_STAGE'
+        set -euo pipefail
+        python3 notify.py pack \
+          "$REPO_NAME" "$ROM_LINK" "$ROM_PREFIX" \
+          "$BUILDER_NAME" "$BUILDER_ID" || true
+        if sudo -E bash packROM.sh 2>&1 | tee "$NEOM_LOG_DIR/pack-output.log"; then
+          echo "ROM repacking stage finished."
+        else
+          if grep -Fq 'No space left on device' "$NEOM_LOG_DIR/pack-output.log"; then
+            echo "::error::Disk capacity exhausted while repacking the ROM."
           else
-            if grep -Fq 'No space left on device' "$RUNNER_TEMP/pack-output.log"; then
-              echo "::error::Disk capacity exhausted while repacking the ROM."
-            else
-              echo "::error::Repacking failed."
-            fi
-            df -h . || true
+            echo "::error::Repacking failed."
+          fi
+          df -h . || true
+          exit 1
+        fi
+        NEOM_PRIVATE_STAGE
+      id: pack
+    - name: Verify generated ROM ZIP
+      working-directory: engine
+      run: |
+        python3 "$NEOM_CI_HELPER" run verify_zip -- bash -e -u -o pipefail <<'NEOM_PRIVATE_STAGE'
+        set -euo pipefail
+        [[ -s bin/ddevice/output_zip.txt ]] || {
+          echo "::error::packROM.sh did not create an output ZIP record."
+          exit 1
+        }
+        zip_name="$(tr -d '\r\n' < bin/ddevice/output_zip.txt)"
+        [[ -n "$zip_name" && "$zip_name" == "$(basename "$zip_name")" ]] || {
+          echo "::error::The generated ZIP filename is invalid."
+          exit 1
+        }
+        [[ -s "out/$zip_name" ]] || {
+          echo "::error::The generated ZIP is missing or empty."
+          exit 1
+        }
+        echo "ROM ZIP generated successfully. Size: $(stat -c '%s' "out/$zip_name") bytes."
+        echo "Output saved for cloud upload."
+        NEOM_PRIVATE_STAGE
+      id: verify_zip
+    - name: Upload ROM to Google Drive
+      working-directory: engine
+      run: |
+        python3 "$NEOM_CI_HELPER" run upload -- bash -e -u -o pipefail <<'NEOM_PRIVATE_STAGE'
+        set -euo pipefail
+        python3 notify.py upload \
+          "$REPO_NAME" "$ROM_LINK" "$ROM_PREFIX" \
+          "$BUILDER_NAME" "$BUILDER_ID" || true
+        if sudo -E bash uploadROM.sh 2>&1 | tee "$NEOM_LOG_DIR/upload-output.log"; then
+          echo "Drive upload and original verification completed."
+        else
+          if ! grep -Fq 'Upload complete:' "$NEOM_LOG_DIR/upload-output.log" || \
+             ! grep -Fq 'Upload verification FAILED:' "$NEOM_LOG_DIR/upload-output.log"; then
+            echo "::error::Google Drive transfer failed."
             exit 1
           fi
-      - name: Verify generated ROM ZIP
-        working-directory: engine
-        run: |
-          set -euo pipefail
-          [[ -s bin/ddevice/output_zip.txt ]] || {
-            echo "::error::packROM.sh did not create an output ZIP record."
-            exit 1
-          }
+          echo "::warning::Original upload verifier failed; checking the cloud copy independently."
           zip_name="$(tr -d '\r\n' < bin/ddevice/output_zip.txt)"
-          [[ -n "$zip_name" && "$zip_name" == "$(basename "$zip_name")" ]] || {
-            echo "::error::The generated ZIP filename is invalid."
-            exit 1
-          }
-          [[ -s "out/$zip_name" ]] || {
-            echo "::error::The generated ZIP is missing or empty."
-            exit 1
-          }
-          echo "ROM ZIP generated successfully. Size: $(stat -c '%s' "out/$zip_name") bytes."
-          echo "Output saved for cloud upload."
-      - name: Load upload configuration
-        working-directory: engine
-        env:
-          RCLONE_CONFIG_B64: ${{ secrets.RCLONE_CONFIG_B64 }}
-        run: |
-          set -euo pipefail
-          umask 077
-          if ! printf '%s' "$RCLONE_CONFIG_B64" | base64 --decode > rclone.conf; then
-            rm -f rclone.conf
-            echo "::error::Could not decode RCLONE_CONFIG_B64."
+          zip_size="$(stat -c '%s' "out/$zip_name")"
+          device_code="$(tr -d '\r\n' < bin/ddevice/device_code.txt)"
+          [[ "$device_code" != *'/'* && -n "$device_code" ]] || exit 1
+          remote_root="${RCLONE_REMOTE_NAME}:${RCLONE_UPLOAD_DIR%/}/Stable/${device_code}/"
+          if ! sudo -E rclone --config="$PWD/rclone.conf" lsjson \
+              --files-only --no-modtime --recursive "$remote_root" \
+              > "$NEOM_LOG_DIR/remote-index.json" 2> "$NEOM_LOG_DIR/remote-errors.log"; then
+            echo "::error::Could not list uploaded files for independent verification."
             exit 1
           fi
-          chmod 600 rclone.conf
-          [[ -s rclone.conf ]] || {
-            echo "::error::Decoded Drive configuration is empty."
+          export NEOM_EXPECTED_ZIP_NAME="$zip_name" NEOM_EXPECTED_ZIP_SIZE="$zip_size"
+          matched_path="$(python3 - "$NEOM_LOG_DIR/remote-index.json" <<'PY'
+        import json
+        import os
+        import sys
+        with open(sys.argv[1], encoding='utf-8') as stream:
+            entries = json.load(stream)
+        target_name = os.environ['NEOM_EXPECTED_ZIP_NAME']
+        target_size = int(os.environ['NEOM_EXPECTED_ZIP_SIZE'])
+        candidates = [entry['Path'] for entry in entries
+                      if isinstance(entry, dict)
+                      and entry.get('Name') == target_name
+                      and entry.get('Size') == target_size
+                      and entry.get('Path')]
+        if len(candidates) != 1:
+            sys.exit(1)
+        print(candidates[0])
+        PY
+          )" || {
+            echo "::error::The Google Drive file name and size could not be verified."
             exit 1
           }
-          unset RCLONE_CONFIG_B64
-          echo "Upload configuration loaded."
-      - name: Verify Drive routing settings
-        working-directory: engine
-        run: |
-          set -euo pipefail
-          [[ -s rclone.conf ]] || { echo "::error::rclone.conf not found."; exit 1; }
-          [[ -n "$RCLONE_REMOTE_NAME" ]] || {
-            echo "::error::Missing RCLONE_REMOTE_NAME in Actions Secrets."
-            exit 1
-          }
-          [[ -n "$RCLONE_UPLOAD_DIR" ]] || {
-            echo "::error::Missing RCLONE_UPLOAD_DIR in Actions Secrets."
-            exit 1
-          }
-          sudo -E rclone --config="$PWD/rclone.conf" listremotes 2>/dev/null | \
-            grep -Fxq "${RCLONE_REMOTE_NAME}:" || {
-              echo "::error::The configured rclone remote was not found."
-              exit 1
-            }
-          echo "Upload configuration validated."
-      - name: Upload ROM to Google Drive
-        working-directory: engine
-        run: |
-          set -euo pipefail
-          python3 notify.py upload \
-            "$REPO_NAME" "$ROM_LINK" "$ROM_PREFIX" \
-            "$BUILDER_NAME" "$BUILDER_ID" || true
-          if sudo -E bash uploadROM.sh > "$RUNNER_TEMP/upload-output.log" 2>&1; then
-            echo "Drive upload and original verification completed."
-          else
-            if ! grep -Fq 'Upload complete:' "$RUNNER_TEMP/upload-output.log" || \
-               ! grep -Fq 'Upload verification FAILED:' "$RUNNER_TEMP/upload-output.log"; then
-              echo "::error::Google Drive transfer failed."
-              exit 1
-            fi
-            echo "::warning::Original upload verifier failed; checking the cloud copy independently."
-            zip_name="$(tr -d '\r\n' < bin/ddevice/output_zip.txt)"
-            zip_size="$(stat -c '%s' "out/$zip_name")"
-            device_code="$(tr -d '\r\n' < bin/ddevice/device_code.txt)"
-            [[ "$device_code" != *'/'* && -n "$device_code" ]] || exit 1
-            remote_root="${RCLONE_REMOTE_NAME}:${RCLONE_UPLOAD_DIR%/}/Stable/${device_code}/"
-            if ! sudo -E rclone --config="$PWD/rclone.conf" lsjson \
-                --files-only --no-modtime --recursive "$remote_root" \
-                > "$RUNNER_TEMP/remote-index.json" 2> "$RUNNER_TEMP/remote-errors.log"; then
-              echo "::error::Could not list uploaded files for independent verification."
-              exit 1
-            fi
-            export NEOM_EXPECTED_ZIP_NAME="$zip_name" NEOM_EXPECTED_ZIP_SIZE="$zip_size"
-            matched_path="$(python3 - "$RUNNER_TEMP/remote-index.json" <<'PY'
-          import json
-          import os
-          import sys
-          with open(sys.argv[1], encoding='utf-8') as stream:
-              entries = json.load(stream)
-          target_name = os.environ['NEOM_EXPECTED_ZIP_NAME']
-          target_size = int(os.environ['NEOM_EXPECTED_ZIP_SIZE'])
-          candidates = [entry['Path'] for entry in entries
-                        if isinstance(entry, dict)
-                        and entry.get('Name') == target_name
-                        and entry.get('Size') == target_size
-                        and entry.get('Path')]
-          if len(candidates) != 1:
-              sys.exit(1)
-          print(candidates[0])
-          PY
-            )" || {
-              echo "::error::The Google Drive file name and size could not be verified."
-              exit 1
-            }
-            remote_file="${remote_root}${matched_path}"
-            link="$(sudo -E rclone --config="$PWD/rclone.conf" link "$remote_file" 2>/dev/null | tail -n 1 | tr -d '\r' || true)"
-            {
-              echo "NEOM_UPLOAD_VERIFIED=1"
-              if [[ "$link" == https://* ]]; then
-                echo "NEOM_GOOGLE_DRIVE_URL=$link"
-              fi
-            } >> "$GITHUB_ENV"
-            if [[ "$link" == https://* ]]; then
-              echo "::add-mask::$link"
-            fi
-            echo "The uploaded ROM is independently verified by filename and size."
-          fi
-      - name: Send success notification
-        if: success()
-        working-directory: engine
-        run: |
-          python3 notify.py success \
-            "$REPO_NAME" "$ROM_LINK" "$ROM_PREFIX" \
-            "$BUILDER_NAME" "$BUILDER_ID" || true
-      - name: Send failure notification
-        if: failure()
-        working-directory: engine
-        run: |
-          python3 notify.py fail \
-            "$REPO_NAME" "$ROM_LINK" "$ROM_PREFIX" \
-            "$BUILDER_NAME" "$BUILDER_ID" || true
-      - name: Remove temporary upload credentials
-        if: always()
-        run: |
-          rm -f "$GITHUB_WORKSPACE/engine/rclone.conf"
-      - name: Build summary
-        if: always()
-        run: |
+          remote_file="${remote_root}${matched_path}"
+          link="$(sudo -E rclone --config="$PWD/rclone.conf" link "$remote_file" 2>/dev/null | tail -n 1 | tr -d '\r' || true)"
           {
-            echo "## Build result"
-            echo "Source checkout: read-only"
-            echo "Upload configuration: loaded at runtime"
-            echo "No build output is uploaded as a workflow artifact."
-            echo "Review the job outcome above for the final result."
-          } >> "$GITHUB_STEP_SUMMARY"
-
+            echo "NEOM_UPLOAD_VERIFIED=1"
+            if [[ "$link" == https://* ]]; then
+              echo "NEOM_GOOGLE_DRIVE_URL=$link"
+            fi
+          } >> "$GITHUB_ENV"
+          if [[ "$link" == https://* ]]; then
+            echo "::add-mask::$link"
+          fi
+          echo "The uploaded ROM is independently verified by filename and size."
+        fi
+        NEOM_PRIVATE_STAGE
+      id: upload
+    - name: Send success notification
+      if: success()
+      run: |
+        python3 "$NEOM_CI_HELPER" run notify_success -- bash -e -u -o pipefail <<'NEOM_PRIVATE_STAGE'
+        if [[ -f "$GITHUB_WORKSPACE/engine/notify.py" ]]; then
+          cd "$GITHUB_WORKSPACE/engine"
+          python3 notify.py success "$REPO_NAME" "$ROM_LINK" "$ROM_PREFIX" "$BUILDER_NAME" "$BUILDER_ID" || true
+        fi
+        NEOM_PRIVATE_STAGE
+      id: notify_success
+    - name: Send failure notification
+      if: failure()
+      run: |
+        python3 "$NEOM_CI_HELPER" run notify_fail -- bash -e -u -o pipefail <<'NEOM_PRIVATE_STAGE'
+        if [[ -f "$GITHUB_WORKSPACE/engine/notify.py" ]]; then
+          cd "$GITHUB_WORKSPACE/engine"
+          python3 notify.py fail "$REPO_NAME" "$ROM_LINK" "$ROM_PREFIX" "$BUILDER_NAME" "$BUILDER_ID" || true
+        fi
+        NEOM_PRIVATE_STAGE
+      id: notify_fail
+    - name: Send complete private log ZIP to Telegram
+      id: deliver_logs
+      if: ${{ always() }}
+      timeout-minutes: 10
+      continue-on-error: true
+      env:
+        NEOM_JOB_STEPS: ${{ toJSON(steps) }}
+        NEOM_JOB_STATUS: ${{ job.status }}
+        ENGINE_READ_TOKEN: ${{ secrets.ENGINE_READ_TOKEN }}
+        RCLONE_CONFIG_B64: ${{ secrets.RCLONE_CONFIG_B64 }}
+      run: |
+        if [[ -f "$NEOM_CI_HELPER" ]]; then
+          sudo -E python3 "$NEOM_CI_HELPER" deliver "$GITHUB_WORKSPACE/engine" "$NEOM_JOB_STATUS"
+        else
+          echo "::warning::The logging utility could not be checked out; no private log sender is available."
+        fi
+    - name: Remove temporary upload credentials
+      if: always()
+      run: |
+        rm -f "$GITHUB_WORKSPACE/engine/rclone.conf"
+      id: cleanup
+    - name: Build summary
+      if: always()
+      run: |
+        {
+          echo "## Build result"
+          echo "Detailed build, extraction, packing and upload logs are reserved for the owner on Telegram."
+          echo "No detailed logs are printed or uploaded as GitHub artifacts."
+          echo "Review the step outcomes above for the final result."
+        } >> "$GITHUB_STEP_SUMMARY"
+      id: summary
+'on':
+  workflow_dispatch:
+    inputs:
+      input_url:
+        description: Direct HTTPS URL of the base ROM ZIP
+        type: string
+        required: true
+      vendor_odm_url:
+        description: Google Drive URL of vendor_odm.zip for sweet
+        required: true
+        type: string
