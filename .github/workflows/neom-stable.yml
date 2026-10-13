@@ -24,10 +24,65 @@ jobs:
       RCLONE_UPLOAD_DIR: ${{ secrets.RCLONE_UPLOAD_DIR }}
       RCLONE_PUBLIC_LINK_BASE: ${{ secrets.RCLONE_PUBLIC_LINK_BASE }}
       TELEGRAM_OWNER_ID: ${{ secrets.TELEGRAM_OWNER_ID }}
-      NEOM_LOG_DIR: ${{ runner.temp }}/neom-private-logs
-      NEOM_PRIVATE_LOG_DIR: ${{ runner.temp }}/neom-private-logs
-      NEOM_CI_HELPER: ${{ github.workspace }}/.ci/.github/scripts/private_ci.py
     steps:
+    - name: Initialize private logs and load private logging utility
+      id: init_logs
+      env:
+        ENGINE_READ_TOKEN: ${{ secrets.ENGINE_READ_TOKEN }}
+        ENGINE_REPO: ${{ secrets.ENGINE_REPO }}
+      run: |
+        set -euo pipefail
+        umask 077
+        export NEOM_LOG_DIR="$RUNNER_TEMP/neom-private-logs"
+        export NEOM_PRIVATE_LOG_DIR="$NEOM_LOG_DIR"
+        export NEOM_CI_HELPER="$RUNNER_TEMP/neom-private-ci.py"
+        mkdir -p "$NEOM_LOG_DIR"
+        {
+          echo "NEOM_LOG_DIR=$NEOM_LOG_DIR"
+          echo "NEOM_PRIVATE_LOG_DIR=$NEOM_PRIVATE_LOG_DIR"
+          echo "NEOM_CI_HELPER=$NEOM_CI_HELPER"
+        } >> "$GITHUB_ENV"
+        python3 <<'PY'
+        import os
+        from pathlib import Path
+        import re
+        import sys
+        import traceback
+        import urllib.error
+        import urllib.request
+        log = Path(os.environ['NEOM_LOG_DIR']) / 'bootstrap.log'
+        try:
+            repo = os.environ.get('ENGINE_REPO', '')
+            token = os.environ.get('ENGINE_READ_TOKEN', '')
+            if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo):
+                raise ValueError('ENGINE_REPO must be owner/repo')
+            if not token:
+                raise ValueError('ENGINE_READ_TOKEN is missing')
+            url = 'https://api.github.com/repos/' + repo + '/contents/bin/ci/private_ci.py?ref=main'
+            request = urllib.request.Request(url, headers={
+                'Authorization': 'Bearer ' + token,
+                'Accept': 'application/vnd.github.raw+json',
+                'X-GitHub-Api-Version': '2022-11-28',
+                'User-Agent': 'Neom-private-ci'})
+            with urllib.request.urlopen(request, timeout=60) as response:
+                source = response.read(1024 * 1024)
+            compile(source, '<private-ci>', 'exec')
+            helper = Path(os.environ['NEOM_CI_HELPER'])
+            helper.write_bytes(source)
+            helper.chmod(0o600)
+            log.write_text('Private logging utility loaded from the engine repository.\n')
+        except Exception as error:
+            detail = traceback.format_exc()
+            if isinstance(error, urllib.error.HTTPError):
+                detail += '\nGitHub API response:\n' + error.read(16384).decode(errors='replace')
+            for name, value in os.environ.items():
+                if value and name.endswith(('_TOKEN', '_SECRET', '_PASSWORD', '_CONFIG_B64')):
+                    detail = detail.replace(value, '[REDACTED]')
+            log.write_text(detail)
+            print('::error::Private logging setup failed. Diagnostics will be sent to your Telegram account.')
+            sys.exit(1)
+        PY
+        python3 "$NEOM_CI_HELPER" init
     - name: Maximize available build space
       uses: easimon/maximize-build-space@fc881a613ad2a34aca9c9624518214ebc21dfc0c
       with:
@@ -39,18 +94,6 @@ jobs:
         remove-codeql: 'true'
         remove-docker-images: 'true'
       id: space
-    - name: Checkout workflow logging utilities
-      id: checkout_utils
-      uses: actions/checkout@v5
-      with:
-        path: .ci
-        fetch-depth: 1
-        show-progress: false
-        persist-credentials: false
-    - name: Initialize private build logs
-      id: init_logs
-      run: |
-        python3 "$NEOM_CI_HELPER" init
     - name: Validate configuration
       env:
         ENGINE_READ_TOKEN: ${{ secrets.ENGINE_READ_TOKEN }}
@@ -300,7 +343,7 @@ jobs:
             exit 1
           }
           remote_file="${remote_root}${matched_path}"
-          link="$(sudo -E rclone --config="$PWD/rclone.conf" link "$remote_file" 2>/dev/null | tail -n 1 | tr -d '\r' || true)"
+          link="$(sudo -E rclone --config="$PWD/rclone.conf" link "$remote_file" 2>> "$NEOM_LOG_DIR/remote-errors.log" | tail -n 1 | tr -d '\r' || true)"
           {
             echo "NEOM_UPLOAD_VERIFIED=1"
             if [[ "$link" == https://* ]]; then
@@ -325,7 +368,7 @@ jobs:
         NEOM_PRIVATE_STAGE
       id: notify_success
     - name: Send failure notification
-      if: failure()
+      if: ${{ failure() && steps.init_logs.outcome == 'success' }}
       run: |
         python3 "$NEOM_CI_HELPER" run notify_fail -- bash -e -u -o pipefail <<'NEOM_PRIVATE_STAGE'
         if [[ -f "$GITHUB_WORKSPACE/engine/notify.py" ]]; then
@@ -345,10 +388,78 @@ jobs:
         ENGINE_READ_TOKEN: ${{ secrets.ENGINE_READ_TOKEN }}
         RCLONE_CONFIG_B64: ${{ secrets.RCLONE_CONFIG_B64 }}
       run: |
-        if [[ -f "$NEOM_CI_HELPER" ]]; then
+        if [[ -f "${NEOM_CI_HELPER:-}" ]]; then
           sudo -E python3 "$NEOM_CI_HELPER" deliver "$GITHUB_WORKSPACE/engine" "$NEOM_JOB_STATUS"
         else
-          echo "::warning::The logging utility could not be checked out; no private log sender is available."
+          python3 <<'PY'
+        import io
+        import json
+        import os
+        from pathlib import Path
+        import re
+        import sys
+        import time
+        import urllib.error
+        import urllib.request
+        import uuid
+        import zipfile
+
+        def request(method, body, content_type):
+            for attempt in range(3):
+                req = urllib.request.Request('https://api.telegram.org/bot' + token + '/' + method,
+                    data=body, headers={'Content-Type': content_type})
+                try:
+                    with urllib.request.urlopen(req, timeout=60) as response:
+                        result = json.loads(response.read())
+                except urllib.error.HTTPError as error:
+                    try:
+                        result = json.loads(error.read())
+                    except ValueError:
+                        result = {'ok': False, 'error_code': error.code}
+                except (OSError, ValueError):
+                    result = {'ok': False, 'error_code': 0}
+                if result.get('ok'):
+                    return result['result']
+                code = result.get('error_code', 0)
+                if code not in (0, 429) and code < 500:
+                    break
+                if attempt < 2:
+                    time.sleep(min(max(int(result.get('parameters', {}).get('retry_after', 2)), 1), 30))
+            raise RuntimeError('Telegram bootstrap log delivery failed')
+
+        try:
+            token = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+            owner = os.environ.get('TELEGRAM_OWNER_ID', '')
+            if not token or not re.fullmatch(r'[1-9][0-9]*', owner):
+                raise ValueError('Bot token and positive personal owner ID are required')
+            chat = request('getChat', json.dumps({'chat_id': owner}).encode(), 'application/json')
+            if chat.get('type') != 'private' or str(chat.get('id')) != owner:
+                raise ValueError('Log recipient must be the configured private owner chat')
+            root = Path(os.environ['RUNNER_TEMP']) / 'neom-private-logs'
+            path = root / 'bootstrap.log'
+            detail = path.read_text(errors='replace') if path.is_file() else 'Logging initialization did not complete.\n'
+            for name, value in os.environ.items():
+                if value and name.endswith(('_TOKEN', '_SECRET', '_PASSWORD', '_CONFIG_B64')):
+                    detail = detail.replace(value, '[REDACTED]')
+            archive = io.BytesIO()
+            with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED) as package:
+                package.writestr('bootstrap.log', detail)
+                package.writestr('summary.json', json.dumps({
+                    'status': os.environ['NEOM_JOB_STATUS'],
+                    'steps': json.loads(os.environ['NEOM_JOB_STEPS'])}, indent=2))
+            boundary = 'neom_' + uuid.uuid4().hex
+            body = bytearray()
+            for name, value in {'chat_id': owner, 'caption': 'Neom initialization failed. Private diagnostics attached.'}.items():
+                body.extend((f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n').encode())
+            body.extend((f'--{boundary}\r\nContent-Disposition: form-data; name="document"; filename="Neom_Bootstrap_Logs.zip"\r\nContent-Type: application/zip\r\n\r\n').encode())
+            body.extend(archive.getvalue())
+            body.extend(f'\r\n--{boundary}--\r\n'.encode())
+            request('sendDocument', bytes(body), 'multipart/form-data; boundary=' + boundary)
+            print('Private initialization log ZIP delivered to your Telegram account.')
+        except Exception as error:
+            print('::warning::Private initialization log delivery failed:', type(error).__name__)
+            sys.exit(1)
+        PY
         fi
     - name: Remove temporary upload credentials
       if: always()
